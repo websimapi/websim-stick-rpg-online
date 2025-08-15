@@ -7,15 +7,35 @@ const startButton = document.getElementById('start-button');
 let audioContext;
 let backgroundMusicSource;
 let footstepSoundBuffer;
+let doorSoundBuffer;
 
 const room = new WebsimSocket();
 
 const PLAYER_SPEED = 3;
 const PLAYER_SIZE = 40;
+const WORLD_WIDTH = 2000;
+const WORLD_HEIGHT = 2000;
+
+const buildings = [
+    { id: 'b1', x: 180, y: 150, width: 250, height: 180, entrance: { x: 280, y: 330, width: 50, height: 10 } },
+    { id: 'b2', x: 750, y: 450, width: 300, height: 200, entrance: { x: 880, y: 650, width: 50, height: 10 } },
+    { id: 'b3', x: 1400, y: 800, width: 200, height: 250, entrance: { x: 1475, y: 1050, width: 50, height: 10 } },
+    { id: 'b4', x: 400, y: 1200, width: 220, height: 160, entrance: { x: 480, y: 1360, width: 50, height: 10 } },
+];
+
+const interiors = {
+    'b1': { exit: { x: 500, y: 900, width: 100, height: 20 }, spawn: { x: 280 + 25, y: 330 - 30 } },
+    'b2': { exit: { x: 500, y: 900, width: 100, height: 20 }, spawn: { x: 880 + 25, y: 650 - 30 } },
+    'b3': { exit: { x: 500, y: 900, width: 100, height: 20 }, spawn: { x: 1475 + 25, y: 1050 - 30 } },
+    'b4': { exit: { x: 500, y: 900, width: 100, height: 20 }, spawn: { x: 480 + 25, y: 1360 - 30 } },
+};
+const INTERIOR_WIDTH = 1000;
+const INTERIOR_HEIGHT = 1000;
 
 const assets = {
     player: new Image(),
     background: new Image(),
+    interior: new Image(),
 };
 
 let assetsLoaded = 0;
@@ -32,7 +52,8 @@ assets.player.src = './player.png';
 assets.player.onload = onAssetLoad;
 assets.background.src = './background.png';
 assets.background.onload = onAssetLoad;
-
+assets.interior.src = './interior.png';
+assets.interior.onload = onAssetLoad;
 
 let input = { x: 0, y: 0 };
 let lastFootstepTime = 0;
@@ -68,13 +89,32 @@ function draw() {
     ctx.translate(camX, camY);
 
     // Draw background
-    ctx.drawImage(assets.background, 0, 0, 2000, 2000);
+    if (localPlayerPresence.interiorId) {
+        ctx.drawImage(assets.interior, 0, 0, INTERIOR_WIDTH, INTERIOR_HEIGHT);
+        // Draw exit zone
+        const exit = interiors[localPlayerPresence.interiorId].exit;
+        ctx.fillStyle = 'rgba(0, 255, 0, 0.3)';
+        ctx.fillRect(exit.x, exit.y, exit.width, exit.height);
+        ctx.fillStyle = 'white';
+        ctx.font = '16px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Exit', exit.x + exit.width / 2, exit.y + exit.height / 2 + 6);
+    } else {
+        ctx.drawImage(assets.background, 0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+         // Draw building collision boxes for debugging and entrance indicators
+        buildings.forEach(building => {
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.0)'; // Invisible collision box
+            ctx.fillRect(building.x, building.y, building.width, building.height);
+            ctx.fillStyle = 'rgba(0, 255, 0, 0.3)'; // Visible entrance
+            ctx.fillRect(building.entrance.x, building.entrance.y, building.entrance.width, building.entrance.height);
+        });
+    }
 
     // Draw players
     for (const clientId in room.presence) {
         const p = room.presence[clientId];
         const peer = room.peers[clientId];
-        if (p && peer) {
+        if (p && peer && p.interiorId === localPlayerPresence.interiorId) {
             // Draw player character
             ctx.drawImage(assets.player, p.x - PLAYER_SIZE / 2, p.y - PLAYER_SIZE / 2, PLAYER_SIZE, PLAYER_SIZE);
             
@@ -106,16 +146,72 @@ function draw() {
     requestAnimationFrame(draw);
 }
 
+function checkCollision(x, y, rects) {
+    const playerRect = { x: x - PLAYER_SIZE / 2, y: y - PLAYER_SIZE / 2, width: PLAYER_SIZE, height: PLAYER_SIZE };
+    for (const rect of rects) {
+        if (playerRect.x < rect.x + rect.width &&
+            playerRect.x + playerRect.width > rect.x &&
+            playerRect.y < rect.y + rect.height &&
+            playerRect.y + playerRect.height > rect.y) {
+            return rect;
+        }
+    }
+    return null;
+}
+
 function update() {
     const localPlayerPresence = room.presence[room.clientId];
     if (!localPlayerPresence || (input.x === 0 && input.y === 0)) {
         return;
     }
+
+    const currentX = localPlayerPresence.x;
+    const currentY = localPlayerPresence.y;
+    let newX = currentX + input.x * PLAYER_SPEED;
+    let newY = currentY + input.y * PLAYER_SPEED;
     
-    const newX = Math.max(0, Math.min(2000, localPlayerPresence.x + input.x * PLAYER_SPEED));
-    const newY = Math.max(0, Math.min(2000, localPlayerPresence.y + input.y * PLAYER_SPEED));
-    
-    if (newX !== localPlayerPresence.x || newY !== localPlayerPresence.y) {
+    let moved = false;
+
+    if (localPlayerPresence.interiorId) {
+        // Inside a building
+        newX = Math.max(PLAYER_SIZE / 2, Math.min(INTERIOR_WIDTH - PLAYER_SIZE / 2, newX));
+        newY = Math.max(PLAYER_SIZE / 2, Math.min(INTERIOR_HEIGHT - PLAYER_SIZE / 2, newY));
+
+        const exit = interiors[localPlayerPresence.interiorId].exit;
+        if (checkCollision(newX, newY, [exit])) {
+            const spawnPoint = interiors[localPlayerPresence.interiorId].spawn;
+            playDoorSound();
+            room.updatePresence({ x: spawnPoint.x, y: spawnPoint.y, interiorId: null });
+            return;
+        }
+    } else {
+        // Outside world
+        newX = Math.max(PLAYER_SIZE / 2, Math.min(WORLD_WIDTH - PLAYER_SIZE / 2, newX));
+        newY = Math.max(PLAYER_SIZE / 2, Math.min(WORLD_HEIGHT - PLAYER_SIZE / 2, newY));
+        
+        const collidingBuilding = checkCollision(newX, newY, buildings);
+        if (collidingBuilding) {
+            // Check if we are in the entrance zone
+            const entrance = collidingBuilding.entrance;
+            if (checkCollision(newX, newY, [entrance])) {
+                playDoorSound();
+                room.updatePresence({ x: INTERIOR_WIDTH / 2, y: INTERIOR_HEIGHT / 2, interiorId: collidingBuilding.id });
+                return;
+            }
+            
+            // Wall collision, try moving along one axis
+            if (!checkCollision(newX, currentY, buildings)) {
+                newY = currentY; // Allow x-axis movement
+            } else if (!checkCollision(currentX, newY, buildings)) {
+                newX = currentX; // Allow y-axis movement
+            } else {
+                newX = currentX;
+                newY = currentY; // Block movement
+            }
+        }
+    }
+
+    if (newX !== currentX || newY !== currentY) {
         room.updatePresence({ x: newX, y: newY });
         playFootstepSound();
     }
@@ -135,6 +231,9 @@ function initAudio() {
     });
     loadSound('./footstep.mp3', (buffer) => {
         footstepSoundBuffer = buffer;
+    });
+    loadSound('./door-open.mp3', (buffer) => {
+        doorSoundBuffer = buffer;
     });
 }
 
@@ -160,12 +259,21 @@ function playFootstepSound() {
     source.start(0);
 }
 
+function playDoorSound() {
+    if (!doorSoundBuffer || !audioContext) return;
+    const source = audioContext.createBufferSource();
+    source.buffer = doorSoundBuffer;
+    source.connect(audioContext.destination);
+    source.start(0);
+}
+
 async function init() {
     await room.initialize();
     
     room.updatePresence({
         x: Math.random() * 500 + 500,
         y: Math.random() * 500 + 500,
+        interiorId: null,
     });
     
     // Keyboard controls
@@ -240,4 +348,3 @@ startButton.addEventListener('click', () => {
     initAudio();
     init();
 });
-
